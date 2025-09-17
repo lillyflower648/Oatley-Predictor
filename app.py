@@ -17,12 +17,8 @@ TEST_CSV = Path("test_matches.csv")  # holdout/test data
 # ---------------- Schemas ----------------
 TRAIN_COLS = ["event_type","team_mode","match_number_in_tourney","kills","placement","ts"]
 TEST_COLS  = [
-    "_tid",                          # stable row id for deletes
-    "event_type","team_mode","match_number_in_tourney",
-    "pred_type","threshold",         # prediction setup
-    "kills","placement",             # actual outcomes
-    "user_pick",                     # optional: YES/NO you picked
-    "ts"
+    "_tid","event_type","team_mode","match_number_in_tourney",
+    "pred_type","threshold","kills","placement","user_pick","ts"
 ]
 
 EVENT_TYPES = ["scrims","fncs","console","cash","skin_cup"]
@@ -40,11 +36,12 @@ def load_df(path: Path, cols: list, gen_id=False, id_col="_tid"):
         if c not in df.columns:
             df[c] = pd.Series(dtype="object")
 
-    # Generate id column if requested
+    # Generate id column if requested (for TEST only)
     if gen_id:
         if id_col not in df.columns or df[id_col].isna().any():
             df[id_col] = list(range(1, len(df)+1))
-        df[id_col] = df[id_col].astype(int)
+        if len(df) > 0:
+            df[id_col] = pd.to_numeric(df[id_col], errors="coerce").fillna(0).astype(int)
 
     # Keep column order
     return df[cols]
@@ -54,6 +51,25 @@ def save_df(df: pd.DataFrame, path: Path):
 
 df = load_df(CSV, TRAIN_COLS, gen_id=False)
 test_df = load_df(TEST_CSV, TEST_COLS, gen_id=True)
+
+def coerce_train_types(d):
+    for c in ["match_number_in_tourney","kills","placement"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0).astype(int)
+    return d
+
+def coerce_test_types(d):
+    if "_tid" in d.columns:
+        d["_tid"] = pd.to_numeric(d["_tid"], errors="coerce")
+    for c in ["match_number_in_tourney","threshold","kills","placement"]:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors="coerce").fillna(0).astype(int)
+    # assign ids if missing
+    if "_tid" not in d.columns or d["_tid"].isna().any():
+        start = 1 if len(test_df)==0 else int(test_df["_tid"].max())+1
+        d["_tid"] = list(range(start, start+len(d)))
+    d["_tid"] = d["_tid"].astype(int)
+    return d
 
 def next_tid():
     return 1 if len(test_df)==0 else int(test_df["_tid"].max())+1
@@ -134,7 +150,7 @@ with st.expander("ℹ️ Notes"):
     st.markdown(
         "- Model: Logistic Regression + Isotonic calibration.\n"
         "- Needs ~25+ training matches. 50–100 recommended.\n"
-        "- Thresholds are chosen at prediction time (no per-row thresholds stored)."
+        "- CSV import/export available even when empty."
     )
 
 # -------- Section 1: Add Match (TRAIN) --------
@@ -157,6 +173,7 @@ with st.form("add_train"):
             "ts": pd.Timestamp.now().isoformat(timespec="seconds")
         }
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+        df = coerce_train_types(df)
         save_df(df, CSV)
         st.success("Saved to training set.")
         st.rerun()
@@ -240,8 +257,38 @@ with tab_stats:
         st.dataframe(df.groupby('event_type').agg({'kills':'mean','placement':'mean'}).round(1), use_container_width=True)
 
 with tab_data:
+    st.subheader("Training CSV")
+    # Importer always visible
+    up = st.file_uploader("📤 Import training CSV", type=["csv"], key="up_train", help="Headers required: " + ", ".join(TRAIN_COLS))
+    if up is not None:
+        with st.spinner("Importing training CSV..."):
+            try:
+                newdf = pd.read_csv(up)
+                # normalize schema
+                for c in TRAIN_COLS:
+                    if c not in newdf.columns:
+                        newdf[c] = pd.Series(dtype="object")
+                newdf = newdf[TRAIN_COLS]
+                newdf = coerce_train_types(newdf)
+                df = pd.concat([df, newdf], ignore_index=True).drop_duplicates()
+                save_df(df, CSV)
+                st.success("Training data imported.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+
+    c1, c2 = st.columns(2)
+    c1.download_button("📥 Download training CSV", data=df.to_csv(index=False),
+                       file_name=f"fortnite_training_{pd.Timestamp.now().strftime('%Y%m%d')}.csv", mime="text/csv")
+    if c2.button("🧹 Reset training dataset"):
+        df = pd.DataFrame(columns=TRAIN_COLS)
+        save_df(df, CSV)
+        st.success("Training dataset cleared.")
+        st.rerun()
+
+    st.markdown("---")
     if len(df) == 0:
-        st.info("No training matches yet.")
+        st.info("No training matches yet. Import a CSV above or add rows in the form.")
     else:
         disp = df.copy().reset_index().rename(columns={"index":"_row_id"})
         disp["_delete"] = False
@@ -255,9 +302,7 @@ with tab_data:
         if c1.button("💾 Save edits"):
             keep = [c for c in ed.columns if c not in ["_row_id","_delete"]]
             new_df = ed[keep].copy()
-            for c in ["match_number_in_tourney","kills","placement"]:
-                if c in new_df.columns:
-                    new_df[c] = pd.to_numeric(new_df[c], errors="coerce").fillna(0).astype(int)
+            new_df = coerce_train_types(new_df)
             df = new_df; save_df(df, CSV); st.success("Training edits saved."); st.rerun()
         if c2.button("🗑️ Delete selected"):
             to_drop = ed.loc[ed["_delete"]==True, "_row_id"].tolist()
@@ -266,17 +311,7 @@ with tab_data:
                 save_df(df, CSV); st.success(f"Deleted {len(to_drop)} rows."); st.rerun()
             else:
                 st.info("No rows selected.")
-        c3.download_button("📥 Download training CSV", data=df.to_csv(index=False),
-                           file_name=f"fortnite_training_{pd.Timestamp.now().strftime('%Y%m%d')}.csv", mime="text/csv")
-        st.markdown("---")
-        up = st.file_uploader("📤 Import training CSV", type=["csv"], key="up_train")
-        if up is not None:
-            try:
-                newdf = pd.read_csv(up)
-                df = pd.concat([df, newdf], ignore_index=True).drop_duplicates()
-                save_df(df, CSV); st.success("Training data imported."); st.rerun()
-            except Exception as e:
-                st.error(f"Import failed: {e}")
+        # c3 is the download button above; leave blank for layout
 
 with tab_graphs:
     if len(df) >= 2:
@@ -301,6 +336,38 @@ with tab_test:
     st.subheader("🧪 Test Set (holdout)")
     st.caption("Import or add known matches here. They are NOT used for training.")
 
+    # Importer always visible
+    up_test = st.file_uploader("📤 Import TEST CSV", type=["csv"], key="up_test",
+                               help="Headers required: " + ", ".join(TEST_COLS))
+    if up_test is not None:
+        with st.spinner("Importing test CSV..."):
+            try:
+                newt = pd.read_csv(up_test)
+                for c in TEST_COLS:
+                    if c not in newt.columns:
+                        newt[c] = pd.Series(dtype="object")
+                newt = newt[TEST_COLS]
+                newt = coerce_test_types(newt)
+                test_df = pd.concat([test_df, newt], ignore_index=True).drop_duplicates(subset=["_tid"])
+                save_df(test_df, TEST_CSV)
+                st.success("Test data imported.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Import failed: {e}")
+
+    c1,c2 = st.columns(2)
+    c1.download_button("📥 Download TEST CSV",
+                       data=test_df.to_csv(index=False),
+                       file_name=f"fortnite_test_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                       mime="text/csv")
+    if c2.button("🧹 Reset test dataset"):
+        test_df = pd.DataFrame(columns=TEST_COLS)
+        save_df(test_df, TEST_CSV)
+        st.success("Test dataset cleared.")
+        st.rerun()
+
+    st.markdown("---")
+
     # Add single test row
     with st.form("add_test"):
         c1,c2 = st.columns(2)
@@ -323,39 +390,12 @@ with tab_test:
                 "user_pick": t_pick, "ts": pd.Timestamp.now().isoformat(timespec="seconds")
             }
             test_df = pd.concat([test_df, pd.DataFrame([row])], ignore_index=True)
+            test_df = coerce_test_types(test_df)
             save_df(test_df, TEST_CSV); st.success("Saved test row."); st.rerun()
 
-    # Import/export test CSV
-    c1,c2 = st.columns(2)
-    c1.download_button(
-        "📥 Download TEST CSV",
-        data=test_df.to_csv(index=False),
-        file_name=f"fortnite_test_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv"
-    )
-    up_test = c2.file_uploader("📤 Import TEST CSV", type=["csv"], key="up_test")
-    if up_test is not None:
-        try:
-            newt = pd.read_csv(up_test)
-            # ensure required cols exist
-            for c in TEST_COLS:
-                if c not in newt.columns:
-                    newt[c] = pd.Series(dtype="object")
-            # ensure ids
-            if "_tid" not in newt.columns or newt["_tid"].isna().any():
-                start = next_tid()
-                newt["_tid"] = list(range(start, start+len(newt)))
-            newt["_tid"] = newt["_tid"].astype(int)
-            # keep canonical order
-            newt = newt[TEST_COLS]
-            test_df = pd.concat([test_df, newt], ignore_index=True).drop_duplicates(subset=["_tid"])
-            save_df(test_df, TEST_CSV); st.success("Imported test CSV."); st.rerun()
-        except Exception as e:
-            st.error(f"Import failed: {e}")
-
-    # Editable test table with WORKING delete
+    # Editable test table with working delete
     if len(test_df)==0:
-        st.info("No test rows yet.")
+        st.info("No test rows yet. Import a CSV above or add rows.")
     else:
         t_disp = test_df.copy()
         t_disp["_delete"] = False
@@ -372,13 +412,9 @@ with tab_test:
         )
         c1,c2 = st.columns(2)
         if c1.button("💾 Save test edits"):
-            # Persist edits, keep id
             keep = [c for c in ed.columns if c != "_delete"]
             new_t = ed[keep].copy()
-            for c in ["match_number_in_tourney","threshold","kills","placement"]:
-                if c in new_t.columns:
-                    new_t[c] = pd.to_numeric(new_t[c], errors="coerce").fillna(0).astype(int)
-            # Keep column order
+            new_t = coerce_test_types(new_t)
             new_t = new_t[TEST_COLS]
             test_df = new_t
             save_df(test_df, TEST_CSV); st.success("Test edits saved."); st.rerun()
@@ -399,8 +435,6 @@ with tab_test:
     else:
         # Train threshold-conditioned models PER DISTINCT (pred_type, threshold) in test set
         results = []
-        # Precompute history features from TRAIN for each threshold once
-        # Evaluate each row with model trained on TRAIN only
         for (ptype, thr) in sorted(test_df[["pred_type","threshold"]].dropna().drop_duplicates().itertuples(index=False)):
             thr = int(thr)
             Xk_e, yk_e, Xp_e, yp_e = make_training(df, thr, thr)
@@ -445,7 +479,6 @@ with tab_test:
             subset["user_correct"] = np.where(pd.notna(subset["user_hat"]),
                                               (subset["user_hat"]==subset["y_true"]).astype(int), np.nan)
 
-            # Metrics per group
             acc  = subset["correct"].mean() if len(subset)>0 else np.nan
             brier= np.mean((subset["pred_prob"] - subset["y_true"])**2) if len(subset)>0 else np.nan
             uacc = subset["user_correct"].mean() if subset["user_correct"].notna().any() else np.nan
@@ -455,7 +488,6 @@ with tab_test:
         if not results:
             st.info("Insufficient training data for evaluation.")
         else:
-            # Aggregate easy-to-read summary
             rows = []
             for ptype, thr, acc, brier, uacc, _ in results:
                 rows.append({
@@ -469,7 +501,6 @@ with tab_test:
             st.subheader("Summary")
             st.dataframe(summary, use_container_width=True)
 
-            # Overall accuracy across all test rows (simple mean of correctness)
             all_parts = [sub for *_, sub in results]
             joined = pd.concat(all_parts, ignore_index=True)
             overall_acc = joined["correct"].mean() if len(joined)>0 else np.nan
@@ -478,7 +509,6 @@ with tab_test:
             c1.metric("Overall Model Accuracy", f"{overall_acc*100:.1f}%" if pd.notna(overall_acc) else "N/A")
             c2.metric("Overall Brier Score", f"{overall_brier:.3f}" if pd.notna(overall_brier) else "N/A")
 
-            # Show detailed rows and allow download
             st.subheader("Detailed Results")
             st.dataframe(joined[[
                 "_tid","event_type","team_mode","match_number_in_tourney",
