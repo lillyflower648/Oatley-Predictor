@@ -3,174 +3,218 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 from sklearn.isotonic import IsotonicRegression
 
+st.set_page_config(page_title="Twitch Predictor", layout="centered")
 CSV = Path("matches.csv")
 
-st.set_page_config(page_title="Twitch Predictor", layout="centered")
-st.title("Twitch Match Predictor")
-
-# ---------------- Storage ----------------
+# -------------------- Storage --------------------
+cols = [
+    "event_type","team_mode","match_number_in_tourney","total_elims_in_tourney_so_far",
+    "kills","placement","K","P","ts"
+]
 if CSV.exists():
     df = pd.read_csv(CSV)
 else:
-    df = pd.DataFrame(columns=[
-        "map","mode","kills","placement",
-        "K","P","ts"
-    ])
+    df = pd.DataFrame(columns=cols)
 
-# ---------------- Helpers ----------------
+# -------------------- Helpers --------------------
+EVENT_TYPES = ["scrims","fncs","console","cash","skin_cup"]
+TEAM_MODES  = ["solo","duo","trio"]
+
 def add_row(d):
     global df
     df = pd.concat([df, pd.DataFrame([d])], ignore_index=True)
     df.to_csv(CSV, index=False)
 
-def features_from_history(hist, K, P):
-    """Build simple, robust features from prior matches only."""
+def hist_feats(hist, K, P):
     if len(hist) == 0:
         return None
-    last_n = hist.tail(min(20, len(hist)))  # small, stable window
-    f = {
-        "n_hist": len(hist),
-        "kills_avg": last_n["kills"].mean(),
-        "kills_std": last_n["kills"].std(ddof=0) if len(last_n)>1 else 0.0,
-        "place_avg": last_n["placement"].mean(),
-        "place_std": last_n["placement"].std(ddof=0) if len(last_n)>1 else 0.0,
-        "hit_rate_k": (last_n["kills"] >= K).mean(),
-        "hit_rate_p": (last_n["placement"] <= P).mean(),
-        "K": K, "P": P
-    }
-    return pd.DataFrame([f])
+    last = hist.tail(min(20, len(hist)))  # small, stable window
+    return pd.DataFrame([{
+        "kills_avg": last["kills"].mean(),
+        "kills_std": last["kills"].std(ddof=0) if len(last)>1 else 0.0,
+        "place_avg": last["placement"].mean(),
+        "place_std": last["placement"].std(ddof=0) if len(last)>1 else 0.0,
+        "hit_rate_k": (last["kills"] >= K).mean(),
+        "hit_rate_p": (last["placement"] <= P).mean(),
+        "K": int(K), "P": int(P)
+    }])
 
 def make_training(df_all):
-    """Create per-row training sets using rolling-history features to avoid leakage."""
     rows_k, rows_p = [], []
     for i in range(len(df_all)):
-        hist = df_all.iloc[:i]  # past only
+        hist = df_all.iloc[:i]
+        if len(hist) == 0: 
+            continue
         K = int(df_all.iloc[i]["K"])
         P = int(df_all.iloc[i]["P"])
-        fx = features_from_history(hist, K, P)
-        if fx is None: 
+        f_basic = hist_feats(hist, K, P)
+        if f_basic is None: 
             continue
+        # only your requested fields as inputs
+        meta = df_all.iloc[i][["event_type","team_mode","match_number_in_tourney","total_elims_in_tourney_so_far"]].to_frame().T
+        Xrow = pd.concat([meta.reset_index(drop=True), f_basic.reset_index(drop=True)], axis=1)
         yk = int(df_all.iloc[i]["kills"] >= K)
         yp = int(df_all.iloc[i]["placement"] <= P)
-        rows_k.append((fx, yk))
-        rows_p.append((fx, yp))
+        rows_k.append((Xrow, yk))
+        rows_p.append((Xrow, yp))
     if rows_k:
-        Xk = pd.concat([x for x,_ in rows_k], ignore_index=True)
-        yk = np.array([y for _,y in rows_k])
+        Xk = pd.concat([x for x,_ in rows_k], ignore_index=True); yk = np.array([y for _,y in rows_k])
     else:
         Xk, yk = None, None
     if rows_p:
-        Xp = pd.concat([x for x,_ in rows_p], ignore_index=True)
-        yp = np.array([y for _,y in rows_p])
+        Xp = pd.concat([x for x,_ in rows_p], ignore_index=True); yp = np.array([y for _,y in rows_p])
     else:
         Xp, yp = None, None
     return Xk, yk, Xp, yp
 
 def fit_model(X, y):
-    if X is None or len(X) < 25 or len(np.unique(y)) < 2:
-        return None, None  # need data
-    model = LogisticRegression(max_iter=1000)
-    model.fit(X, y)
+    if X is None or y is None or len(X) < 25 or len(np.unique(y)) < 2:
+        return None, None
+    cat = ["event_type","team_mode"]
+    num = ["match_number_in_tourney","total_elims_in_tourney_so_far",
+           "kills_avg","kills_std","place_avg","place_std","hit_rate_k","hit_rate_p","K","P"]
+    pre = ColumnTransformer([
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat),
+        ("num", "passthrough", num)
+    ])
+    clf = LogisticRegression(max_iter=1000)
+    pipe = Pipeline([("pre", pre), ("clf", clf)])
+    pipe.fit(X, y)
     # calibration
-    p = model.predict_proba(X)[:,1]
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(p, y)
-    return model, iso
+    p_train = pipe.predict_proba(X)[:,1]
+    iso = IsotonicRegression(out_of_bounds="clip").fit(p_train, y)
+    return pipe, iso
 
-def predict(model, iso, Xrow, fallback):
+def predict_proba(model, iso, Xrow, fallback):
     if model is None or iso is None:
         return fallback
     p = model.predict_proba(Xrow)[:,1][0]
     return float(iso.transform([p])[0])
 
-def implied_prob(multiplier):
-    # Pari-mutuel approx: p_imp ≈ 1/M
-    try:
-        m = float(multiplier)
-        return 1.0/m if m>0 else None
-    except:
-        return None
+def implied_from_mult(M_yes, M_no):
+    # Approx pari-mutuel implied probs; allow blanks
+    py = 1.0/float(M_yes) if M_yes and float(M_yes)>0 else None
+    pn = 1.0/float(M_no)  if M_no  and float(M_no)>0  else None
+    return py, pn
 
-def edge_and_kelly(p, m):
-    """Return edge and Kelly fraction for a YES bet with payout multiplier m."""
-    if m is None or m<=1 or p is None:
-        return None, 0.0
-    b = m - 1.0
-    f_star = (b*p - (1-p)) / b
-    return p - 1.0/m, max(0.0, min(1.0, f_star))
+def recommend_side(p_model, M_yes, M_no):
+    py, pn = implied_from_mult(M_yes, M_no)
+    if py and pn:
+        edge_yes = p_model - py
+        edge_no  = (1-p_model) - pn
+        if edge_yes>0 or edge_no>0:
+            return ("YES" if edge_yes>=edge_no else "NO", edge_yes, edge_no, py, pn)
+        return ("PASS", edge_yes, edge_no, py, pn)
+    # no multipliers: simple threshold at 0.5
+    if p_model > 0.5: 
+        return ("YES", None, None, None, None)
+    if p_model < 0.5:
+        return ("NO", None, None, None, None)
+    return ("PASS", None, None, None, None)
 
-# ---------------- Input form ----------------
-st.subheader("Add match")
-with st.form("match"):
+# ===================== UI =====================
+
+st.title("Twitch Prediction Helper")
+
+# -------- Section 1: Add Match --------
+st.header("Add Match")
+with st.form("add_match"):
     c1, c2 = st.columns(2)
-    map_name = c1.text_input("Map", "")
-    mode = c2.text_input("Mode", "")
+    event_type = c1.selectbox("Event type", EVENT_TYPES, index=0)
+    team_mode  = c2.selectbox("Team mode", TEAM_MODES, index=0)
+
     c3, c4 = st.columns(2)
-    kills = c3.number_input("Final kills", min_value=0, step=1)
-    placement = c4.number_input("Final placement (1 = win)", min_value=1, step=1)
+    match_num = c3.number_input("Match number in tournament", min_value=1, step=1)
+    total_elims_t = c4.number_input("Total elims in tournament so far", min_value=0, step=1)
+
     c5, c6 = st.columns(2)
-    K = c5.number_input("Kills threshold K", min_value=1, value=5, step=1)
-    P = c6.number_input("Placement threshold P (≤P counts as YES)", min_value=1, value=10, step=1)
+    kills = c5.number_input("Final kills (this match)", min_value=0, step=1)
+    placement = c6.number_input("Final placement (1 = win)", min_value=1, step=1)
+
+    c7, c8 = st.columns(2)
+    K = c7.number_input("Your K threshold (for elim predictions)", min_value=1, value=5, step=1)
+    P = c8.number_input("Your P threshold (for placement predictions)", min_value=1, value=10, step=1)
+
     submitted = st.form_submit_button("Save match")
     if submitted:
         add_row({
-            "map": map_name, "mode": mode, "kills": int(kills),
-            "placement": int(placement), "K": int(K), "P": int(P),
+            "event_type": event_type,
+            "team_mode": team_mode,
+            "match_number_in_tourney": int(match_num),
+            "total_elims_in_tourney_so_far": int(total_elims_t),
+            "kills": int(kills),
+            "placement": int(placement),
+            "K": int(K),
+            "P": int(P),
             "ts": pd.Timestamp.now().isoformat(timespec="seconds")
         })
         st.success("Saved.")
 
 st.divider()
-st.subheader("Current probability and edge")
 
-c1, c2, c3 = st.columns(3)
-K = c1.number_input("Evaluate K", min_value=1, value=int(df["K"].iloc[-1]) if len(df) else 5, step=1)
-P = c2.number_input("Evaluate P", min_value=1, value=int(df["P"].iloc[-1]) if len(df) else 10, step=1)
-hist_n = c3.number_input("History window (display only)", min_value=5, value=20, step=1)
-
-# Train models from df
+# -------- Train models (on current data) --------
 Xk, yk, Xp, yp = make_training(df)
-mk, ck = fit_model(Xk, yk)
-mp, cp = fit_model(Xp, yp)
+mk, ck = fit_model(Xk, yk)  # kills>=K
+mp, cp = fit_model(Xp, yp)  # placement<=P
 
-# Build current feature row from full history
-Xrow = features_from_history(df, int(K), int(P))
+# Build current feature row from all history
+def current_Xrow(evalK, evalP):
+    if len(df)==0: 
+        return None
+    f = hist_feats(df, evalK, evalP)
+    if f is None: 
+        return None
+    # meta inputs must be provided for evaluation; reuse last known meta
+    last_meta = df.iloc[[-1]][["event_type","team_mode","match_number_in_tourney","total_elims_in_tourney_so_far"]].reset_index(drop=True)
+    return pd.concat([last_meta, f], axis=1)
+
+# -------- Section 2: Current Prediction --------
+st.header("Current Prediction")
+c1, c2 = st.columns(2)
+pred_type = c1.selectbox("Prediction type", ["eliminations","placement"], index=0)
+threshold = c2.number_input("Threshold (K for elims, P for placement)", min_value=1, value=5, step=1)
+
+d1, d2 = st.columns(2)
+M_yes = d1.text_input("YES multiplier (optional)", "")
+M_no  = d2.text_input("NO multiplier (optional)", "")
+
+Xrow = current_Xrow(threshold if pred_type=="eliminations" else df["K"].iloc[-1] if len(df) else threshold,
+                    threshold if pred_type=="placement"    else df["P"].iloc[-1] if len(df) else threshold)
+
 if Xrow is None:
-    st.info("Add at least one match.")
+    st.info("Add at least one match to evaluate.")
 else:
-    # Fallback = moving hit rates
-    last_n = df.tail(min(hist_n, len(df)))
-    fb_k = (last_n["kills"] >= K).mean() if len(last_n)>0 else 0.5
-    fb_p = (last_n["placement"] <= P).mean() if len(last_n)>0 else 0.5
+    # Fallbacks from last 20 matches
+    last = df.tail(min(20, len(df)))
+    fb_k = (last["kills"]    >= threshold).mean() if len(last)>0 else 0.5
+    fb_p = (last["placement"]<=  threshold).mean() if len(last)>0 else 0.5
 
-    p_yes_k = predict(mk, ck, Xrow, fb_k)
-    p_yes_p = predict(mp, cp, Xrow, fb_p)
+    if pred_type=="eliminations":
+        p_model = predict_proba(mk, ck, Xrow, fb_k)
+        st.write(f"Model Pr(kills ≥ {int(threshold)}) ≈ **{p_model:.2f}**")
+    else:
+        p_model = predict_proba(mp, cp, Xrow, fb_p)
+        st.write(f"Model Pr(place ≤ {int(threshold)}) ≈ **{p_model:.2f}**")
 
-    st.write(f"Pr(kills ≥ {int(K)}) ≈ **{p_yes_k:.2f}**")
-    st.write(f"Pr(place ≤ {int(P)}) ≈ **{p_yes_p:.2f}**")
-
-    st.markdown("**Optional:** enter pool multipliers to compute edge and Kelly size.")
-    d1, d2 = st.columns(2)
-    M_yes_k = d1.text_input("Multiplier for YES (kills≥K)", "2.0")
-    M_yes_p = d2.text_input("Multiplier for YES (place≤P)", "2.0")
-
-    imp_k = implied_prob(M_yes_k)
-    imp_p = implied_prob(M_yes_p)
-
-    edge_k, kelly_k = edge_and_kelly(p_yes_k, float(M_yes_k) if imp_k else None)
-    edge_p, kelly_p = edge_and_kelly(p_yes_p, float(M_yes_p) if imp_p else None)
-
-    st.write(f"Kills≥K: implied p≈{imp_k:.2f} | model p≈{p_yes_k:.2f} | edge≈{(edge_k if edge_k is not None else 0):+.2f} | Kelly≈{kelly_k:.2f}")
-    st.write(f"Place≤P: implied p≈{imp_p:.2f} | model p≈{p_yes_p:.2f} | edge≈{(edge_p if edge_p is not None else 0):+.2f} | Kelly≈{kelly_p:.2f}")
+    side, edge_yes, edge_no, py, pn = recommend_side(p_model, M_yes, M_no)
+    st.subheader(f"Recommendation: **{side}**")
+    if py is not None and pn is not None:
+        st.caption(f"Implied p(YES)≈{py:.2f}, p(NO)≈{pn:.2f}. Edge(YES)≈{edge_yes:+.2f}, Edge(NO)≈{edge_no:+.2f}.")
+    else:
+        st.caption("No multipliers provided. Using 0.5 threshold heuristic.")
 
 st.divider()
-st.subheader("Data")
 
+# -------- Section 3: Data --------
+st.header("Data")
 c1, c2 = st.columns(2)
 with c1:
-    st.dataframe(df.tail(50), use_container_width=True)
+    st.dataframe(df.tail(100), use_container_width=True)
 with c2:
     st.download_button("Download CSV", data=df.to_csv(index=False), file_name="matches.csv")
     up = st.file_uploader("Restore/Append CSV", type=["csv"])
@@ -182,3 +226,25 @@ with c2:
             st.success("CSV merged.")
         except Exception as e:
             st.error(f"Upload failed: {e}")
+
+st.subheader("Graphs")
+if len(df) >= 1:
+    df_plot = df.copy()
+    df_plot["idx"] = range(1, len(df_plot)+1)
+    kc = st.checkbox("Show kills over matches", value=True)
+    pc = st.checkbox("Show placement over matches", value=True)
+    hr = st.checkbox("Show rolling hit rates (last 20)", value=True)
+
+    if kc:
+        st.line_chart(df_plot.set_index("idx")["kills"])
+    if pc:
+        st.line_chart(df_plot.set_index("idx")["placement"])
+    if hr:
+        if len(df_plot) >= 1:
+            K_current = int(df_plot["K"].iloc[-1]) if len(df_plot) else 5
+            P_current = int(df_plot["P"].iloc[-1]) if len(df_plot) else 10
+            win_k = (df_plot["kills"] >= K_current).rolling(20, min_periods=1).mean()
+            win_p = (df_plot["placement"] <= P_current).rolling(20, min_periods=1).mean()
+            st.line_chart(pd.DataFrame({"hit_rate_k": win_k, "hit_rate_p": win_p}))
+else:
+    st.info("Graphs appear after you add data.")
